@@ -2,6 +2,8 @@
 
 A small browser game where bouncing balls move through one shared screen space and appear in each browser window at their real screen position.
 
+![Five-second demo of glowing balls crossing between two browser windows](assets/window-balls-demo.gif)
+
 ## Run locally
 
 From this repository, start a local web server:
