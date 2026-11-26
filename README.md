@@ -1,6 +1,6 @@
 # Window Balls
 
-A small browser game where bouncing balls pass between separate windows, including when those windows are resized.
+A small browser game where bouncing balls move through one shared screen space and appear in each browser window at their real screen position.
 
 ## Run locally
 
@@ -10,8 +10,8 @@ From this repository, start a local web server:
 python3 -m http.server 8765
 ```
 
-Open `http://localhost:8765` in a desktop browser. Click **Open window** and arrange the windows side by side. If your browser opens a tab, drag that tab into its own window. Click **Start 24 balls**. Use **Add 12 balls** for more, or **Clear** to reset.
+Open `http://localhost:8765` in a desktop browser. Click **Open window** and arrange the windows side by side. If your browser opens a tab, drag that tab into its own window. Move your pointer inside each window once for precise alignment, then click **Start 24 balls**. Use **Add 12 balls** for more, or **Clear** to reset.
 
-The windows communicate through `BroadcastChannel`, so they must use the same URL origin. Each ball belongs to one window. When its center crosses an edge, that window sends it to the next window in opening order. The receiving window places it at the same relative height. Both windows draw the ball briefly while it straddles the boundary, which softens the handoff. The balls bounce off the top and bottom of their current window and the unlinked outer side edges.
+The windows communicate through `BroadcastChannel`, so they must use the same URL origin. They share each ball's starting position, velocity, and start time. Every window calculates the same position and draws only the part that falls inside its viewport. There is no transfer event to cause a visual jump. The balls bounce against the display edges, which stay fixed when a window is resized.
 
-This version does not measure physical screen positions. It works after resizing, but a gap or browser frame between windows remains visible during a transfer.
+Pointer events calibrate the page's exact screen position. Before calibration, the page estimates the browser chrome offset. A physical gap or browser frame between windows is still visible because the ball cannot be drawn outside a web page.
