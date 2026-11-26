@@ -31,11 +31,11 @@
   <canvas id="game" aria-label="Bouncing balls moving across browser windows"></canvas>
   <div class="top">
     <div class="brand">WINDOW BALLS</div>
-    <div class="readout" id="readout">Finding window position…</div>
+    <div class="readout" id="readout">Linking windows…</div>
   </div>
   <div class="help" id="help">
-    <strong>One arena. Many windows.</strong>
-    Open this page in separate desktop browser windows and arrange them side by side. Move your pointer inside each window once, then start the balls. If Open window creates a tab, drag that tab into its own window.
+    <strong>One game. Many windows.</strong>
+    Open this page in separate desktop browser windows, then start the balls. They leave one window edge and enter the next at the same relative height, even after resizing. Windows connect in opening order. If Open window creates a tab, drag it into its own window.
   </div>
   <div class="bottom">
     <button id="open">Open window</button>
@@ -60,73 +60,74 @@
         history.replaceState(null, '', `${location.pathname}?${params}${location.hash}`);
       }
 
-      const channel = new BroadcastChannel('window-balls-v2');
+      const channel = new BroadcastChannel('window-balls-edge-v1');
       const windowId = crypto.randomUUID();
+      const joinedAt = Date.now();
       const peers = new Map();
-      let scene = null;
+      const incomingPreviews = new Map();
+      const colors = ['#8cfbe6', '#ffd47f', '#ff92b2', '#a5adff', '#8ed3ff'];
+      let balls = [];
+      let outgoingGhosts = [];
+      let generation = null;
       let width = 0, height = 0;
-      let calibratedOffset = null;
+      let notice = '', noticeUntil = 0;
+      let lastFrame = performance.now();
 
-      // A pointer event reveals the viewport's exact screen origin. Keep the
-      // offset from the outer window so it stays valid while the window moves.
-      addEventListener('pointermove', calibrate);
-      addEventListener('pointerdown', calibrate);
-      function calibrate(event) {
-        calibratedOffset = {
-          x: event.screenX - event.clientX - window.screenX,
-          y: event.screenY - event.clientY - window.screenY
-        };
+      function send(type, details = {}) {
+        channel.postMessage({ type, room, windowId, ...details });
       }
 
-      function viewportOrigin() {
-        if (calibratedOffset) {
-          return { x: window.screenX + calibratedOffset.x,
-                   y: window.screenY + calibratedOffset.y };
-        }
-        // Browser chrome has no standard viewport-origin API. This estimate
-        // works for ordinary browser windows until the pointer calibrates it.
-        const side = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-        const top = Math.max(0, window.outerHeight - window.innerHeight - side);
-        return { x: window.screenX + side, y: window.screenY + top };
+      function clamp(value, low, high) {
+        return Math.min(Math.max(value, low), high);
       }
 
       function resize() {
-        const dpr = window.devicePixelRatio || 1;
+        const oldWidth = width, oldHeight = height;
         width = window.innerWidth;
         height = window.innerHeight;
+        const dpr = window.devicePixelRatio || 1;
         canvas.width = Math.round(width * dpr);
         canvas.height = Math.round(height * dpr);
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      }
-      addEventListener('resize', resize);
-      resize();
-
-      function ownRect() {
-        const origin = viewportOrigin();
-        return { x: origin.x, y: origin.y, width, height };
+        if (oldWidth && oldHeight) {
+          for (const ball of balls) {
+            ball.x = clamp(ball.x * width / oldWidth, ball.radius, Math.max(ball.radius, width - ball.radius));
+            ball.y = clamp(ball.y * height / oldHeight, ball.radius, Math.max(ball.radius, height - ball.radius));
+          }
+        }
+        publishPresence();
       }
 
       function publishPresence() {
-        channel.postMessage({ type: 'presence', room, windowId, rect: ownRect() });
+        send('presence', { joinedAt, count: balls.length });
       }
 
-      function activeRects() {
+      function activeWindows() {
         const now = Date.now();
-        const rects = [ownRect()];
+        const windows = [{ id: windowId, joinedAt, count: balls.length }];
         for (const [id, peer] of peers) {
           if (now - peer.seen > 2500) peers.delete(id);
-          else rects.push(peer.rect);
+          else windows.push({ id, joinedAt: peer.joinedAt, count: peer.count });
         }
-        return rects;
+        return windows.sort((a, b) => a.joinedAt - b.joinedAt || a.id.localeCompare(b.id));
       }
 
-      function accept(next) {
-        if (!next || !Number.isFinite(next.updated) || !Array.isArray(next.balls) ||
-            next.balls.length > 72 || typeof next.id !== 'string') return;
-        if (!scene || next.updated > scene.updated ||
-            (next.updated === scene.updated && next.id > scene.id)) {
-          scene = next;
-          help.hidden = next.balls.length > 0;
+      function neighbor(direction) {
+        const windows = activeWindows();
+        const index = windows.findIndex(item => item.id === windowId);
+        return windows[index + direction] || null;
+      }
+
+      function acceptGeneration(next) {
+        if (!next || !Number.isFinite(next.updated) || typeof next.id !== 'string') return;
+        if (!generation || next.updated > generation.updated ||
+            (next.updated === generation.updated && next.id > generation.id)) {
+          generation = next;
+          balls = [];
+          incomingPreviews.clear();
+          outgoingGhosts = [];
+          help.hidden = false;
+          publishPresence();
         }
       }
 
@@ -134,136 +135,230 @@
         if (!data || data.room !== room || data.windowId === windowId) return;
         if (data.type === 'hello') {
           publishPresence();
-          if (scene) channel.postMessage({ type: 'scene', room, scene });
+          if (generation) send('reset', { generation });
         } else if (data.type === 'presence') {
-          const r = data.rect;
-          if (r && [r.x, r.y, r.width, r.height].every(Number.isFinite) &&
-              r.width > 0 && r.height > 0) {
-            peers.set(data.windowId, { rect: r, seen: Date.now() });
+          if (Number.isFinite(data.joinedAt) && Number.isFinite(data.count)) {
+            peers.set(data.windowId, {
+              joinedAt: data.joinedAt, count: data.count, seen: Date.now()
+            });
           }
-        } else if (data.type === 'scene') {
-          accept(data.scene);
+        } else if (data.type === 'reset') {
+          acceptGeneration(data.generation);
+        } else if (data.type === 'preview' && data.to === windowId &&
+                   generation?.id === data.generationId) {
+          const preview = data.preview;
+          if (preview && typeof preview.id === 'string' &&
+              !balls.some(ball => ball.id === preview.id) &&
+              [preview.offset, preview.yFraction, preview.vx, preview.vy,
+               preview.radius, preview.at, preview.sourceHeight].every(Number.isFinite)) {
+            incomingPreviews.set(preview.id, preview);
+          }
+        } else if (data.type === 'handoff' && data.to === windowId &&
+                   generation?.id === data.generationId) {
+          const incoming = data.ball;
+          if (!incoming || typeof incoming.id !== 'string' ||
+              ![incoming.vx, incoming.vy, incoming.radius, data.yFraction, data.overshoot].every(Number.isFinite) ||
+              balls.some(ball => ball.id === incoming.id)) return;
+          const radius = incoming.radius;
+          const overshoot = clamp(data.overshoot, 0, Math.max(0, width - radius));
+          balls.push({
+            ...incoming,
+            x: data.direction === 1 ? overshoot : width - overshoot,
+            y: radius + clamp(data.yFraction, 0, 1) * Math.max(0, height - 2 * radius)
+          });
+          incomingPreviews.delete(incoming.id);
+          help.hidden = true;
+          publishPresence();
         } else if (data.type === 'bye') {
           peers.delete(data.windowId);
         }
       };
-      channel.postMessage({ type: 'hello', room, windowId });
-      publishPresence();
+
+      addEventListener('resize', resize);
+      resize();
+      send('hello');
       setInterval(publishPresence, 350);
       addEventListener('beforeunload', () => {
-        channel.postMessage({ type: 'bye', room, windowId });
+        send('bye');
         channel.close();
       });
 
-      function makeBalls(count) {
-        const rects = activeRects();
-        const arena = {
-          left: Math.min(...rects.map(r => r.x)),
-          top: Math.min(...rects.map(r => r.y)),
-          right: Math.max(...rects.map(r => r.x + r.width)),
-          bottom: Math.max(...rects.map(r => r.y + r.height))
+      function newGeneration() {
+        const next = {
+          id: crypto.randomUUID(),
+          updated: Math.max(Date.now(), (generation?.updated || 0) + 1)
         };
-        const colors = ['#8cfbe6', '#ffd47f', '#ff92b2', '#a5adff', '#8ed3ff'];
-        const started = Date.now();
+        acceptGeneration(next);
+        send('reset', { generation: next });
+      }
+
+      function makeBalls(count) {
         return Array.from({ length: count }, (_, i) => {
-          const r = rects[i % rects.length];
           const radius = 8 + Math.random() * 5;
-          const padding = radius + 16;
-          const x = r.x + padding + Math.random() * Math.max(0, r.width - 2 * padding);
-          const y = r.y + padding + Math.random() * Math.max(0, r.height - 2 * padding);
           const angle = Math.random() * Math.PI * 2;
           const speed = 170 + Math.random() * 190;
           return {
-            x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
-            radius, color: colors[i % colors.length], arena, started
+            id: crypto.randomUUID(),
+            x: radius + Math.random() * Math.max(0, width - 2 * radius),
+            y: radius + Math.random() * Math.max(0, height - 2 * radius),
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            radius,
+            color: colors[i % colors.length]
           };
         });
       }
 
-      function setBalls(balls) {
-        const next = {
-          id: crypto.randomUUID(),
-          updated: Math.max(Date.now(), (scene?.updated || 0) + 1),
-          balls: balls.slice(-72)
-        };
-        accept(next);
-        channel.postMessage({ type: 'scene', room, scene: next });
-      }
-      document.querySelector('#start').onclick = () => setBalls(makeBalls(24));
-      document.querySelector('#add').onclick = () =>
-        setBalls([...(scene?.balls || []), ...makeBalls(12)]);
-      document.querySelector('#clear').onclick = () => setBalls([]);
+      document.querySelector('#start').onclick = () => {
+        newGeneration();
+        balls = makeBalls(24);
+        help.hidden = true;
+        publishPresence();
+      };
+      document.querySelector('#add').onclick = () => {
+        if (!generation) newGeneration();
+        balls.push(...makeBalls(Math.min(12, Math.max(0, 72 - balls.length))));
+        help.hidden = balls.length === 0;
+        publishPresence();
+      };
+      document.querySelector('#clear').onclick = newGeneration;
       document.querySelector('#open').onclick = () => {
-        const url = new URL(location.href);
-        const popup = window.open(url.href, '_blank',
-          `popup=yes,width=640,height=460,left=${Math.round(window.screenX + 80)},top=${Math.round(window.screenY + 80)}`);
+        const popup = window.open(location.href, '_blank', 'popup=yes,width=640,height=460');
         notice = popup
           ? 'If it opened as a tab, drag it into a separate window.'
           : 'Popup blocked; allow popups, then try again.';
         noticeUntil = Date.now() + 6000;
       };
-      let notice = '';
-      let noticeUntil = 0;
 
-      // Triangle-wave motion gives every window the same bounce position from
-      // the shared start time, without a frame-by-frame network authority.
-      function reflected(start, velocity, seconds, low, high) {
-        const span = high - low;
-        if (span <= 0) return (low + high) / 2;
-        const travel = start - low + velocity * seconds;
-        const phase = ((travel % (2 * span)) + 2 * span) % (2 * span);
-        return low + (phase <= span ? phase : 2 * span - phase);
+      function bounceVertical(ball, dt) {
+        const low = ball.radius, high = Math.max(low, height - ball.radius);
+        ball.y += ball.vy * dt;
+        if (ball.y < low) {
+          ball.y = low + (low - ball.y);
+          ball.vy = Math.abs(ball.vy);
+        } else if (ball.y > high) {
+          ball.y = high - (ball.y - high);
+          ball.vy = -Math.abs(ball.vy);
+        }
+        ball.y = clamp(ball.y, low, high);
       }
 
-      function draw() {
-        const origin = viewportOrigin();
+      function advance(dt) {
+        const remaining = [];
+        const previous = neighbor(-1), next = neighbor(1);
+        for (const ball of balls) {
+          bounceVertical(ball, dt);
+          ball.x += ball.vx * dt;
+          const direction = ball.vx > 0 ? 1 : -1;
+          const target = direction === 1 ? next : previous;
+          const edge = direction === 1 ? width : 0;
+          const offset = ball.x - edge;
+          const crossing = direction === 1 ? offset > 0 : offset < 0;
+          const approaching = Math.abs(offset) <= ball.radius;
+          if (target && generation && crossing) {
+            send('handoff', {
+              to: target.id,
+              generationId: generation.id,
+              direction,
+              ball,
+              overshoot: Math.abs(offset),
+              yFraction: (ball.y - ball.radius) / Math.max(1, height - 2 * ball.radius)
+            });
+            outgoingGhosts.push({ ...ball, at: Date.now() });
+            continue;
+          }
+          if (target && generation && approaching) {
+            send('preview', {
+              to: target.id,
+              generationId: generation.id,
+              preview: {
+                id: ball.id, offset,
+                yFraction: (ball.y - ball.radius) / Math.max(1, height - 2 * ball.radius),
+                vx: ball.vx, vy: ball.vy, radius: ball.radius,
+                color: ball.color, sourceHeight: height, at: Date.now(), direction
+              }
+            });
+          }
+          const left = ball.radius, right = Math.max(left, width - ball.radius);
+          if (!next && ball.x > right) {
+            ball.x = right - (ball.x - right);
+            ball.vx = -Math.abs(ball.vx);
+          } else if (!previous && ball.x < left) {
+            ball.x = left + (left - ball.x);
+            ball.vx = Math.abs(ball.vx);
+          }
+          ball.x = clamp(ball.x, previous ? 0 : left, next ? width : right);
+          remaining.push(ball);
+        }
+        const transferred = remaining.length !== balls.length;
+        balls = remaining;
+        if (transferred) publishPresence();
+      }
+
+      function paintBall(ball, x, y) {
+        const { radius } = ball;
+        const glow = ctx.createRadialGradient(x, y, radius / 3, x, y, radius * 3);
+        glow.addColorStop(0, `${ball.color}aa`);
+        glow.addColorStop(1, `${ball.color}00`);
+        ctx.fillStyle = glow;
+        ctx.beginPath(); ctx.arc(x, y, radius * 3, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = ball.color;
+        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#ffffffa8';
+        ctx.beginPath(); ctx.arc(x - radius / 3, y - radius / 3,
+          radius / 4, 0, Math.PI * 2); ctx.fill();
+      }
+
+      function draw(now) {
+        const dt = Math.min((now - lastFrame) / 1000, 0.05);
+        lastFrame = now;
+        advance(Math.max(0, dt));
         ctx.clearRect(0, 0, width, height);
 
-        // The grid is anchored to screen coordinates, so its lines line up
-        // across adjacent windows too.
-        const grid = 80;
         ctx.strokeStyle = '#263a56';
         ctx.lineWidth = 1;
         ctx.beginPath();
-        for (let x = -((origin.x % grid) + grid) % grid; x < width; x += grid) {
+        for (let x = 0; x < width; x += 80) {
           ctx.moveTo(x + .5, 0); ctx.lineTo(x + .5, height);
         }
-        for (let y = -((origin.y % grid) + grid) % grid; y < height; y += grid) {
+        for (let y = 0; y < height; y += 80) {
           ctx.moveTo(0, y + .5); ctx.lineTo(width, y + .5);
         }
         ctx.stroke();
 
-        let visible = 0;
-        if (scene) {
-          const now = Date.now();
-          for (const ball of scene.balls) {
-            const seconds = (now - ball.started) / 1000;
-            const { arena, radius } = ball;
-            const x = reflected(ball.x, ball.vx, seconds,
-              arena.left + radius, arena.right - radius) - origin.x;
-            const y = reflected(ball.y, ball.vy, seconds,
-              arena.top + radius, arena.bottom - radius) - origin.y;
-            if (x < -radius || x > width + radius ||
-                y < -radius || y > height + radius) continue;
-            visible++;
-            const glow = ctx.createRadialGradient(x, y, radius / 3, x, y, radius * 3);
-            glow.addColorStop(0, `${ball.color}aa`);
-            glow.addColorStop(1, `${ball.color}00`);
-            ctx.fillStyle = glow;
-            ctx.beginPath(); ctx.arc(x, y, radius * 3, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = ball.color;
-            ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = '#ffffffa8';
-            ctx.beginPath(); ctx.arc(x - radius / 3, y - radius / 3,
-              radius / 4, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#43cdb433';
+        if (neighbor(-1)) ctx.fillRect(0, 0, 5, height);
+        if (neighbor(1)) ctx.fillRect(width - 5, 0, 5, height);
+
+        const nowMs = Date.now();
+        outgoingGhosts = outgoingGhosts.filter(ghost => {
+          const elapsed = (nowMs - ghost.at) / 1000;
+          const x = ghost.x + ghost.vx * elapsed;
+          if (elapsed > 0.25 || x + ghost.radius < 0 || x - ghost.radius > width) return false;
+          paintBall(ghost, x, ghost.y + ghost.vy * elapsed);
+          return true;
+        });
+        for (const [id, preview] of incomingPreviews) {
+          const elapsed = (nowMs - preview.at) / 1000;
+          if (elapsed > 0.2 || balls.some(ball => ball.id === id)) {
+            incomingPreviews.delete(id);
+            continue;
           }
+          const x = (preview.direction === 1 ? 0 : width) +
+            preview.offset + preview.vx * elapsed;
+          const y = preview.radius + clamp(preview.yFraction, 0, 1) *
+            Math.max(0, height - 2 * preview.radius) +
+            preview.vy * elapsed * height / Math.max(1, preview.sourceHeight);
+          paintBall(preview, x, y);
         }
-        status.textContent = Date.now() < noticeUntil
-          ? notice
-          : scene?.balls.length
-            ? `${scene.balls.length} bouncing · ${visible} visible here`
-            : 'Waiting to start';
-        readout.textContent = `Screen ${Math.round(origin.x)}, ${Math.round(origin.y)} · ${activeRects().length} window(s) · ${calibratedOffset ? 'calibrated' : 'estimated'}`;
+        for (const ball of balls) paintBall(ball, ball.x, ball.y);
+
+        const windows = activeWindows();
+        const total = windows.reduce((sum, item) => sum + item.count, 0);
+        const index = windows.findIndex(item => item.id === windowId) + 1;
+        readout.textContent = `${windows.length} window(s) linked · pane ${index}`;
+        status.textContent = Date.now() < noticeUntil ? notice
+          : total ? `${total} bouncing · ${balls.length} here` : 'Waiting to start';
         requestAnimationFrame(draw);
       }
       requestAnimationFrame(draw);
